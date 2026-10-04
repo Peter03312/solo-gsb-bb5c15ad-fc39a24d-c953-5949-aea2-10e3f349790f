@@ -267,6 +267,32 @@ CREATE TABLE IF NOT EXISTS checkout_items (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_checkout_items_active_item
   ON checkout_items (item_id) WHERE returned_at IS NULL;
+
+-- 设备排班：把生效预约安排到具体离心设备。时段复制自预约冻结的左闭右开窗口，
+-- 排班后不再随预约改写（预约取消时同步置 cancelled）。
+-- 每个预约至多一条「生效中」排班（部分唯一索引兜底）；取消保留历史行，
+-- 此后可再次排班（新行）；改派在原行更新 device_no 并累计 reassign_count。
+-- 同设备生效排班不得重叠（左闭右开，首尾相接允许）：由服务端在单事务内
+-- 重读重叠排班核对（部分索引 + 事务兜底并发）。
+CREATE TABLE IF NOT EXISTS device_schedules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  reservation_id INTEGER NOT NULL,
+  device_no TEXT NOT NULL,
+  start_utc TEXT NOT NULL,
+  end_utc TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'cancelled')),
+  reassign_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  cancelled_at TEXT,
+  FOREIGN KEY (reservation_id) REFERENCES reservations(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_device_schedules_active_reservation
+  ON device_schedules (reservation_id) WHERE status = 'active';
+
+CREATE INDEX IF NOT EXISTS idx_device_schedules_active_device
+  ON device_schedules (device_no, start_utc, end_utc) WHERE status = 'active';
 `;
 
 // 既有库平滑升级：runs 增加开始时冻结的校准依据列（老库无此列时补齐；
@@ -936,4 +962,100 @@ export function markCheckoutItemReturned(db, checkoutId, itemId, { condition, re
     )
     .run(returnedAt, condition, checkoutId, itemId);
   return info.changes === 1;
+}
+
+// ---------- 设备排班（由 server 在单事务内调用） ----------
+
+export function insertDeviceSchedule(db, { reservationId, deviceNo, startUtc, endUtc, nowIso }) {
+  const info = db
+    .prepare(
+      `INSERT INTO device_schedules
+         (reservation_id, device_no, start_utc, end_utc, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(reservationId, deviceNo, startUtc, endUtc, nowIso, nowIso);
+  return getDeviceScheduleRow(db, info.lastInsertRowid);
+}
+
+export function getDeviceScheduleRow(db, id) {
+  return db.prepare('SELECT * FROM device_schedules WHERE id = ?').get(id);
+}
+
+export function getActiveDeviceScheduleByReservation(db, reservationId) {
+  return db
+    .prepare(
+      `SELECT * FROM device_schedules WHERE reservation_id = ? AND status = 'active'`,
+    )
+    .get(reservationId);
+}
+
+export function listDeviceScheduleRows(db) {
+  return db
+    .prepare('SELECT * FROM device_schedules ORDER BY start_utc, id')
+    .all();
+}
+
+// 与 [startIso, endIso) 重叠的某设备生效排班；excludeReservationId 用于改派时
+// 排除本预约自身（左闭右开：r.start < end AND start < r.end）。
+export function findOverlappingActiveDeviceSchedule(
+  db,
+  deviceNo,
+  startIso,
+  endIso,
+  excludeReservationId = null,
+) {
+  const sql = `
+    SELECT * FROM device_schedules
+     WHERE status = 'active'
+       AND device_no = ?
+       AND start_utc < ?
+       AND ? < end_utc
+       AND (? IS NULL OR reservation_id <> ?)
+     ORDER BY start_utc, id
+     LIMIT 1`;
+  return db.prepare(sql).get(deviceNo, endIso, startIso, excludeReservationId, excludeReservationId);
+}
+
+// 改派：在原行原子换设备（条件更新：仅生效中行可改派；失败返回 null）。
+export function reassignDeviceSchedule(db, id, deviceNo, nowIso) {
+  const info = db
+    .prepare(
+      `UPDATE device_schedules
+          SET device_no = ?, reassign_count = reassign_count + 1, updated_at = ?
+        WHERE id = ? AND status = 'active'`,
+    )
+    .run(deviceNo, nowIso, id);
+  return info.changes === 1 ? getDeviceScheduleRow(db, id) : null;
+}
+
+// 取消排班：仅生效中行可取消（条件更新，未命中返回 null）。
+export function cancelDeviceSchedule(db, id, nowIso) {
+  const info = db
+    .prepare(
+      `UPDATE device_schedules
+          SET status = 'cancelled', cancelled_at = ?, updated_at = ?
+        WHERE id = ? AND status = 'active'`,
+    )
+    .run(nowIso, nowIso, id);
+  return info.changes === 1 ? getDeviceScheduleRow(db, id) : null;
+}
+
+// 预约取消时同步取消其生效排班（级联；未命中返回 null）。
+export function cancelActiveDeviceScheduleByReservation(db, reservationId, nowIso) {
+  const info = db
+    .prepare(
+      `UPDATE device_schedules
+          SET status = 'cancelled', cancelled_at = ?, updated_at = ?
+        WHERE reservation_id = ? AND status = 'active'`,
+    )
+    .run(nowIso, nowIso, reservationId);
+  return info.changes === 1
+    ? db
+        .prepare(
+          `SELECT * FROM device_schedules
+            WHERE reservation_id = ? AND status = 'cancelled'
+            ORDER BY id DESC LIMIT 1`,
+        )
+        .get(reservationId)
+    : null;
 }

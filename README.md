@@ -100,6 +100,16 @@
 **不改写领还历史**（领用单冻结预约时段与占用量快照，实物编号与规格随单冻结）；
 领还冲突整体回滚，**不留部分记录**。
 
+实验室还需把**生效的配重预约安排到具体离心设备**：操作者提交**预约编号与非空设备编号**，
+排班时段**沿用预约冻结的 UTC 左闭右开时段**（不提交时间）。**同一设备的生效排班不得
+重叠**，首尾相接允许，并可按设备和时段查询占用与冲突。**每个预约至多一条生效排班**：
+同预约同设备重复提交**返回原记录**（200）；换设备必须走**显式改派**接口。**改派只允许
+在预约开始前且该预约尚未用于运行时**完成，并在单个事务内**原子释放旧设备时段、占用新
+设备时段**，新设备冲突则整体回滚、**保留原排班**。**已取消的预约、已开始的预约或已用于
+运行的预约不得改派或新排班**；**未开始且未运行的排班可取消**，保留历史并释放占用；
+**预约取消时同步取消其排班**并释放占用。**开始运行时若该预约有生效排班，提交的设备
+必须一致**；**无生效排班沿用原放行规则**，同运行编号同内容重放仍返回原冻结运行。
+
 ## 约束模型
 
 - 孔位编号 `0 … N-1`，孔位数 N 为 4–12 的偶数；孔 `i` 与孔 `i + N/2` 对径，孔 `i` 与孔 `(i+1)%N` 环形相邻。
@@ -284,12 +294,26 @@ npm test
     5. 查询（`GET /api/items`、`GET /api/checkouts`）展示实物状态、当前占用
        领用单、每单未还件与逾期状态；预约取消、库存调整及运行状态变化均不改写
        领还历史。
+16. **设备排班**（HTTP API）：
+    1. 提交预约编号与非空设备编号排班（`POST /api/reservations/:id/schedule`）：
+       时段沿用预约冻结窗口；同设备生效排班不得重叠（首尾相接允许）。同预约同设备
+       重复提交返回原记录（200），同预约换设备直接排班返回 409（须走改派）。
+    2. 改派（`POST /api/schedules/:id/reassign`）仅允许在预约开始前且预约尚未用于
+       运行时完成；原子释放旧设备时段、占用新设备时段，冲突时 409 且保留原排班；
+       同设备重放返回原记录。
+    3. 未开始且未运行的排班可取消（`POST /api/schedules/:id/cancel`），保留历史、
+       释放占用，已取消重复调用幂等；取消预约时其生效排班被同步取消。
+    4. 查询：`GET /api/schedules`（可按 `deviceNo` / `reservationId` / `status` 过滤）、
+       `GET /api/schedules/:id`，以及按设备和时段查占用与冲突
+       （`GET /api/devices/:deviceNo/occupancy?from=&to=`）。
+    5. 开始运行：预约有生效排班时提交设备必须与排班一致（否则 409）；
+       无生效排班沿用原放行规则；同运行编号同内容重放仍返回原冻结运行。
 
 ## REST API 摘要
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/state` | 当前录入数据（含避邻对与固定孔位）、数据指纹、草稿（含是否过期）、发布列表、核验列表、预约与停用列表、离心运行列表（`runs`）、设备保养状态列表（`devices`，含每台设备最新校准）、保养记录列表（`maintenances`）、设备校准记录列表（`calibrations`）、配重实物列表（`items`）与领用单列表（`checkouts`） |
+| GET | `/api/state` | 当前录入数据（含避邻对与固定孔位）、数据指纹、草稿（含是否过期）、发布列表、核验列表、预约与停用列表、离心运行列表（`runs`）、设备保养状态列表（`devices`，含每台设备最新校准）、保养记录列表（`maintenances`）、设备校准记录列表（`calibrations`）、配重实物列表（`items`）、领用单列表（`checkouts`）与设备排班列表（`schedules`） |
 | PUT | `/api/config` | 整体替换转子配置（孔位数、容差、各孔最大承重），事务；缩小孔数使现有固定孔位越界时整次拒绝 |
 | PUT | `/api/tubes` | 整体替换全部离心管，事务，校验失败回滚；替换后若留下失效避邻对（对中管不再存在）或失效固定孔位（管不存在或孔位不再可用）拒绝并保留原数据 |
 | PUT | `/api/weights` | 整体替换全部配重规格，事务，校验失败回滚；库存缩减若使某规格数量低于其有效实物数（已登记未注销）则整次拒绝并保留原数据 |
@@ -309,17 +333,17 @@ npm test
 | POST | `/api/reservations` | 创建配重块时段预约（批次号 + 可用发布图 + UTC 起止，左闭右开）；事务内原子重读图/当前库存/重叠预约/**重叠停用**；201 新建、200 幂等重放、400 非法输入或图不可用、409 批次冲突或「占用+停用」超库存（附冲突规格与时段） |
 | GET | `/api/reservations` | 预约列表（含状态、阶段、依据图当前可用性、各规格占用） |
 | GET | `/api/reservations/:id` | 单条预约详情 |
-| POST | `/api/reservations/:id/cancel` | 取消预约（仅未开始）；已取消幂等返回原记录；已开始 409 |
+| POST | `/api/reservations/:id/cancel` | 取消预约（仅未开始）；已取消幂等返回原记录；已开始 409；若该预约有生效排班则**同步取消排班并释放设备时段**。响应与预约列表新增 `schedule` 字段（当前生效排班摘要，无则 `null`） |
 | POST | `/api/suspensions` | 登记配重块临时停用（质量规格 + 正整数数量 + 原因 + UTC 起止，左闭右开）；事务内重读当前库存与重叠生效停用，超量拒绝不留记录；201 新建、400 非法输入/未知规格、409 超量（附冲突规格与时段） |
 | GET | `/api/suspensions` | 停用列表（含状态、阶段 `notStarted/ongoing/ended/revoked`、是否可撤销、原因与撤销时间；含已撤销历史） |
 | GET | `/api/suspensions/:id` | 单条停用详情 |
 | POST | `/api/suspensions/:id/revoke` | 撤销停用（仅未开始）；已撤销幂等返回原记录；已开始/已结束 409；撤销后立即释放后续容量 |
-| POST | `/api/runs` | 开始离心运行（唯一运行编号 + 非空设备编号 + 已完成核验编号 + 预约编号；开始时间服务端记录）。事务内确认核验已完成、核验与生效预约同图、发布图当前可用、当前时刻处于预约左闭右开时段、预约未被其他运行使用、同设备无进行中运行、设备保养额度未达上限（未设上限不核对）、**设备最新校准合格且到期不早于预约终点（无校准记录不核对）**；201 新建、200 同号同内容幂等重放（不重新核对保养额度与校准）、400 非法输入/未知核验或预约、409 状态冲突（附 `existingId`/`existingRunId`，保养拒绝附 `detail.device`，校准拒绝附 `detail.calibration` 与 `detail.reason`=`failed`/`expired`），失败不留记录 |
+| POST | `/api/runs` | 开始离心运行（唯一运行编号 + 非空设备编号 + 已完成核验编号 + 预约编号；开始时间服务端记录）。事务内确认核验已完成、核验与生效预约同图、发布图当前可用、当前时刻处于预约左闭右开时段、预约未被其他运行使用、同设备无进行中运行、**预约若有生效排班则提交设备必须与排班设备一致（无排班不核对）**、设备保养额度未达上限（未设上限不核对）、**设备最新校准合格且到期不早于预约终点（无校准记录不核对）**；201 新建、200 同号同内容幂等重放（不重新核对排班/保养额度与校准）、400 非法输入/未知核验或预约、409 状态冲突（排班设备不一致附 `detail.scheduledDeviceNo`/`detail.scheduleId`，附 `existingId`/`existingRunId`，保养拒绝附 `detail.device`，校准拒绝附 `detail.calibration` 与 `detail.reason`=`failed`/`expired`），失败不留记录 |
 | GET | `/api/runs` | 运行列表（运行状态、超时标记、开始/结束时间与冻结依据；冻结依据含开始时的校准记录 `frozenBasis.calibration`；依据图当前可用性仅作展示） |
 | GET | `/api/runs/:id` | 单条运行详情（含冻结发布图快照、冻结核验结论、冻结预约时段与冻结校准依据；开始时设备无校准记录则 `frozenBasis.calibration` 为 `null`） |
 | POST | `/api/runs/:id/complete` | 完结运行（`outcome` 为 `completed`/`aborted`；结束时间服务端记录且须晚于开始；超过预约终点如实完结并置 `timedOut`，随即释放设备、不改写预约）；201 首次完结、200 同状态幂等重放、400 非法 outcome、409 异状态改报（附 `existingOutcome`） |
-| GET | `/api/devices` | 设备保养状态列表：设备编号、当前状态（空闲/运行中）、最新校准（`latestCalibration`，无记录为 `null`）与校准记录数、保养上限、本周期已用秒数与已完结次数、剩余额度、待保养标记、最近保养时间（含仅有校准记录的设备） |
-| GET | `/api/devices/:deviceNo` | 单台设备保养状态（同上，含最新校准）；设备未知（无运行、上限、保养或校准记录）返回 404 |
+| GET | `/api/devices` | 设备保养状态列表：设备编号、当前状态（空闲/运行中）、最新校准（`latestCalibration`，无记录为 `null`）与校准记录数、保养上限、本周期已用秒数与已完结次数、剩余额度、待保养标记、最近保养时间（含仅有校准记录或仅有生效排班的设备） |
+| GET | `/api/devices/:deviceNo` | 单台设备保养状态（同上，含最新校准）；设备未知（无运行、上限、保养、校准记录或生效排班）返回 404 |
 | PUT | `/api/devices/:deviceNo/limit` | 设置/调整保养上限（`limitSeconds` 为正整数秒）；仅影响后续开始判定，不改写历史；200 返回设备状态，400 非法输入 |
 | DELETE | `/api/devices/:deviceNo/limit` | 清除保养上限，设备恢复「未设置上限」的原行为（幂等 200） |
 | POST | `/api/maintenances` | 登记保养（唯一保养单号 + 设备编号 + 原因；登记时刻服务端记录并开启新累计周期）；设备须空闲；201 新建、200 同号同内容幂等重放、400 非法输入、409 异内容（附 `existingId`）或设备运行中（附 `existingRunId`） |
@@ -336,6 +360,12 @@ npm test
 | GET | `/api/checkouts` | 领用单列表（冻结预约时段与占用量、逐件明细、未还件 `unreturned`、逾期 `overdue`、状态 `out/partial/returned`） |
 | GET | `/api/checkouts/:id` | 单条领用单详情；不存在返回 404 |
 | POST | `/api/checkouts/:id/returns` | 归还（`returns` 为 `{itemNo, condition}` 非空数组，`condition` 为 `intact`/`damaged`）：逐件标记，非本单实物及重复归还整次拒绝（409，附 `detail.{notMine,alreadyReturned}`，不留部分记录）；预约结束后仍可归还；201 完成、400 非法输入、404 领用单不存在 |
+| POST | `/api/reservations/:id/schedule` | 把预约排班到设备（body `{deviceNo}`，非空；时段沿用预约冻结窗口）；201 新建、200 同预约同设备幂等返回原排班；400 非法设备编号/未知预约；409 预约已取消/已开始/已用于运行、同预约已排班到别的设备（附 `detail.scheduleId`/`detail.scheduledDeviceNo`，须走改派）、目标设备时段重叠（附冲突排班 `detail.conflictingScheduleId` 等）；事务内核对、不留部分数据 |
+| POST | `/api/schedules/:id/reassign` | 改派排班（body `{deviceNo}`）：仅预约开始前且未用于运行；原子释放旧设备时段、占用新设备时段，冲突 409 并保留原排班（附冲突排班详情）；同设备重放 200；已取消/已开始/已运行 409；排班不存在 404 |
+| POST | `/api/schedules/:id/cancel` | 取消排班（仅生效中、预约未开始且未运行）：保留历史、释放设备时段；已取消幂等 200；已开始/已运行 409；不存在 404 |
+| GET | `/api/schedules` | 排班列表（含已取消历史）；可加 `?deviceNo=`、`?reservationId=`（正整数）、`?status=active|cancelled` 过滤（非法参数 400）。字段含设备、冻结时段、`phase`=`notStarted/ongoing/ended/cancelled`、`reassignCount`、`reassignable`、`cancellable`、`runId` |
+| GET | `/api/schedules/:id` | 单条排班详情；不存在返回 404 |
+| GET | `/api/devices/:deviceNo/occupancy?from=&to=` | 按设备和时段查询占用与冲突：`segments[]` 为左闭右开占用分段（`count`、`reservationIds`、`conflict`），`peak` 为峰值占用、`hasConflict` 标记同设备重叠，`schedules` 为窗口内生效排班；from/to 省略时覆盖该设备全部生效排班（无排班以当前时刻为窗口）；from≥to 或时间非法 400 |
 | GET | `/api/schedule?from=&to=` | 日程：各质量规格在时段内的预约占用分段（`segments`，占用超库存 `shortage`）、停用分段（`suspendedSegments`）与「占用+停用」合计分段（`combinedSegments`，合计超库存 `shortage` / 规格级 `combinedShortage`）；from/to 缺省为覆盖全部生效中预约与停用 |
 
 错误统一返回 `400 {"error","errors":[...]}`；状态冲突（草稿已存在、版本过期、核验已冻结、
@@ -347,7 +377,11 @@ npm test
 数量），均可直接用于日程定位。实物领用冲突时 409 响应的 `detail.items` 标明不可领实物
 （被占用附 `checkoutId`、损坏、已注销），规格不匹配时 `detail.mismatches` 给出各规格
 「需 / 选」数量；归还整次拒绝时 `detail.notMine` / `detail.alreadyReturned` 分别列出
-非本单实物与重复归还实物。
+非本单实物与重复归还实物。排班设备时段冲突时 409 响应的 `detail` 内带
+`deviceNo`、`conflictingScheduleId`、`conflictingReservationId` 与冲突窗口
+（`conflictingStartUtc`/`conflictingEndUtc`）；同预约重复排班到不同设备时
+`detail.scheduleId`/`detail.scheduledDeviceNo` 指向原排班；开始运行设备与排班
+不一致时 `detail.scheduleId`/`detail.scheduledDeviceNo` 给出排班信息。
 
 ## 避邻对 HTTP API 调用示例
 
@@ -912,13 +946,95 @@ curl -s "$BASE/api/items?mass=50"
 curl -s $BASE/api/items/1
 ```
 
+## 设备排班 HTTP API 调用示例
+
+```bash
+BASE=http://localhost:8080
+
+# 0) 前置：一条未开始的生效预约 #7（时段为预约冻结窗口，排班不提交时间）
+curl -s $BASE/api/reservations/7
+# -> {"id":7,"status":"active","phase":"notStarted","startUtc":"...","endUtc":"...",
+#     "schedule":null, ...}
+
+# 1) 排班：提交预约编号（路径）与非空设备编号（body.deviceNo）→ 201
+curl -s -X POST $BASE/api/reservations/7/schedule \
+  -H 'Content-Type: application/json' -d '{"deviceNo":"CENT-01"}'
+# -> {"id":1,"reservationId":7,"deviceNo":"CENT-01",
+#     "startUtc":"...（与预约一致）","endUtc":"...（与预约一致）",
+#     "status":"active","phase":"notStarted","reassignCount":0,
+#     "reassignable":true,"cancellable":true,"runId":null,...}
+
+# 2) 幂等：同预约同设备重复提交 → 200 原排班；同预约换设备直接排班 → 409（须改派）
+curl -s -X POST $BASE/api/reservations/7/schedule \
+  -H 'Content-Type: application/json' -d '{"deviceNo":"CENT-01"}'   # 200 原记录
+curl -s -X POST $BASE/api/reservations/7/schedule \
+  -H 'Content-Type: application/json' -d '{"deviceNo":"CENT-02"}'
+# -> 409 {"errors":["预约 #7 已排班到设备「CENT-01」（排班 #1），每个预约至多一条
+#                   生效排班；需要更换设备请调用改派接口，不能重复排班"],
+#         "existingId":1,
+#         "detail":{"scheduleId":1,"scheduledDeviceNo":"CENT-01"}}
+
+# 3) 同设备时段不得重叠（左闭右开，首尾相接允许）；冲突 → 409 且不留排班
+#    预约 #8 与预约 #7 时段重叠，排到同一设备被拒绝：
+curl -s -X POST $BASE/api/reservations/8/schedule \
+  -H 'Content-Type: application/json' -d '{"deviceNo":"CENT-01"}'
+# -> 409 {"errors":["设备「CENT-01」在 … 至 … 已被预约 #7 的生效排班 #1 占用
+#                   （同设备生效排班不得重叠，首尾相接允许），本次排班未生效：原排班保持不变"],
+#         "detail":{"deviceNo":"CENT-01","conflictingScheduleId":1,
+#                   "conflictingReservationId":7,
+#                   "conflictingStartUtc":"...","conflictingEndUtc":"..."}}
+# 终点相接（#8.start == #7.end）或换一台设备 → 201
+
+# 4) 改派：预约开始前且未用于运行，原子释放旧设备、占用新设备
+curl -s -X POST $BASE/api/schedules/1/reassign \
+  -H 'Content-Type: application/json' -d '{"deviceNo":"CENT-03"}'
+# -> 200 {"id":1,"deviceNo":"CENT-03","reassignCount":1,...}
+# 同设备重放 → 200（reassignCount 不变）；新设备时段冲突 → 409，原排班保留：
+curl -s -X POST $BASE/api/schedules/1/reassign \
+  -H 'Content-Type: application/json' -d '{"deviceNo":"CENT-02"}'
+# -> 409 {"errors":["设备「CENT-02」… 已被预约 #9 的生效排班 #2 占用 …，
+#                   本次改派未生效：原排班保持不变"], "detail":{...}}
+# 已开始 / 已用于运行 / 预约已取消 → 409；排班不存在 → 404
+
+# 5) 取消排班：仅未开始且未运行；已取消幂等；取消后时段立即释放，可重新排班
+curl -s -X POST $BASE/api/schedules/1/cancel
+# -> 200 {"status":"cancelled","cancelledAt":"...","cancellable":false,...}
+# 预约取消时其生效排班被同步取消：
+curl -s -X POST $BASE/api/reservations/7/cancel
+# -> {"status":"cancelled","schedule":null,...}   # 排班历史仍可在列表查到
+
+# 6) 查询：列表（可按设备 / 预约 / 状态过滤）与单条
+curl -s $BASE/api/schedules
+curl -s "$BASE/api/schedules?deviceNo=CENT-01"
+curl -s "$BASE/api/schedules?reservationId=7&status=active"
+curl -s $BASE/api/schedules/1
+
+# 7) 按设备和时段查询占用与冲突（from/to 可省略，缺省覆盖该设备全部生效排班）
+curl -s "$BASE/api/devices/CENT-01/occupancy?from=2026-10-06T00:00:00Z&to=2026-10-07T00:00:00Z"
+# -> {"deviceNo":"CENT-01","from":"...","to":"...","peak":1,"hasConflict":false,
+#     "segments":[{"start":"2026-10-06T08:00:00.000Z","end":"2026-10-06T12:00:00.000Z",
+#                  "count":1,"reservationIds":[7],"conflict":false}],
+#     "schedules":[{...排班视图...}]}
+# 首尾相接的两条排班呈现为两个相邻分段（前段 end == 后段 start），各自 count=1。
+
+# 8) 开始运行的设备一致性：预约有生效排班时，提交设备必须与排班一致
+curl -s -X POST $BASE/api/runs -H 'Content-Type: application/json' \
+  -d '{"runNo":"RUN-1","deviceNo":"CENT-09","verificationId":3,"reservationId":7}'
+# -> 409 {"errors":["预约 #7 已排班到设备「CENT-03」，本次提交设备「CENT-09」
+#                   与排班设备不一致，不能开始运行；预约开始前可改派排班，开始后设备即锁定"],
+#         "detail":{"scheduleId":1,"scheduledDeviceNo":"CENT-03"}}
+# 用排班设备开始 → 201；预约无生效排班时沿用原放行规则（任意设备均可）；
+# 同运行编号同内容重放 → 200 原冻结运行（不重新核对排班设备）。
+```
+
 ## 目录结构
 
 ```
 src/
-  server.js     Express 服务与路由、原子发布/核验/预约/停用/运行/保养/校准/实物领还事务
+  server.js     Express 服务与路由、原子发布/核验/预约/停用/运行/保养/校准/实物领还/
+                设备排班事务
   db.js         SQLite 连接、建表（含固定孔位表、离心运行表、设备上限/保养/校准表、
-                配重实物与领用单表）、数据访问
+                配重实物与领用单表、设备排班表）、数据访问
   solver.js     求解器（含避邻对与固定孔位约束）、独立复核、数据指纹（纯函数，含测试）
   verify.js     现场核验：录入规整、进度、完成判定（纯函数，含测试）
   reserve.js    时段预约与临时停用：UTC 解析、冻结图占用、双层扫描线（占用+停用）
@@ -930,10 +1046,12 @@ src/
                 与开始运行放行判定（最新记录合格且到期不早于预约终点）（纯函数，含测试）
   checkout.js   配重实物领还：实物登记/领用/归还输入规整、按规格精确匹配冻结占用量、
                 库存缩减核对与逾期判定（纯函数，含测试）
+  schedule.js   设备排班：排班/改派输入规整、左闭右开重叠判定与设备占用分段
+                （纯函数，含测试）
   validate.js   输入校验（非法质量/重复编号/越界/避邻对/固定孔位）、400/409 错误类型
 public/         浏览器界面（原生 HTML/CSS/JS，无需构建）
 test/           node --test 测试（求解器 + 避邻对 + 固定孔位 + HTTP API + 核验
                 + 时段预约 + 临时停用 + 离心运行 + 设备保养 + 设备校准
-                + 配重实物领还，共 167 项）
+                + 配重实物领还 + 设备排班，共 181 项）
 Dockerfile / docker-compose.yml
 ```
