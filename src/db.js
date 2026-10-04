@@ -267,6 +267,65 @@ CREATE TABLE IF NOT EXISTS checkout_items (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_checkout_items_active_item
   ON checkout_items (item_id) WHERE returned_at IS NULL;
+
+-- 预约设备排班：把生效预约安排到具体离心设备，时段沿用预约冻结的 UTC
+-- 左闭右开 [start_utc, end_utc)（start/end 冗余自预约，改派/取消均不改写预约）。
+--   active     生效排班，占用该设备时段；
+--   cancelled  未开始且未用于运行时取消（历史保留，释放占用）；
+--   reassigned 改派到其他设备后旧排班（历史保留，释放旧设备时段），
+--              replaced_by_id 指向新生效排班。
+-- 一个预约至多一条生效排班（部分唯一索引兜底；改派在单事务内先置旧排班为
+-- reassigned 再插入新排班）；同设备生效排班不得重叠（左闭右开，首尾相接允许）
+-- 由应用事务判定，并由下面两个触发器兜底。
+CREATE TABLE IF NOT EXISTS schedules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  reservation_id INTEGER NOT NULL,
+  device_no TEXT NOT NULL,
+  start_utc TEXT NOT NULL,
+  end_utc TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active'
+    CHECK (status IN ('active', 'cancelled', 'reassigned')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  cancelled_at TEXT,
+  replaced_by_id INTEGER,
+  FOREIGN KEY (reservation_id) REFERENCES reservations(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_active_reservation
+  ON schedules (reservation_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_schedules_active_device
+  ON schedules (device_no, start_utc, end_utc) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_schedules_reservation
+  ON schedules (reservation_id, id);
+
+-- 同设备生效排班左闭右开不得重叠：r.start < new.end AND new.start < r.end
+-- （相接 r.end == new.start 或 new.end == r.start 均不触发）。INSERT/UPDATE 均兜底。
+CREATE TRIGGER IF NOT EXISTS trg_schedules_no_overlap_insert
+BEFORE INSERT ON schedules
+WHEN NEW.status = 'active' AND EXISTS (
+  SELECT 1 FROM schedules
+   WHERE status = 'active'
+     AND device_no = NEW.device_no
+     AND start_utc < NEW.end_utc
+     AND NEW.start_utc < end_utc
+)
+BEGIN
+  SELECT RAISE(ABORT, '设备排班时段冲突（同设备生效排班不得重叠，首尾相接允许）');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_schedules_no_overlap_update
+BEFORE UPDATE OF device_no, start_utc, end_utc, status ON schedules
+WHEN NEW.status = 'active' AND EXISTS (
+  SELECT 1 FROM schedules
+   WHERE status = 'active'
+     AND id != NEW.id
+     AND device_no = NEW.device_no
+     AND start_utc < NEW.end_utc
+     AND NEW.start_utc < end_utc
+)
+BEGIN
+  SELECT RAISE(ABORT, '设备排班时段冲突（同设备生效排班不得重叠，首尾相接允许）');
+END;
 `;
 
 // 既有库平滑升级：runs 增加开始时冻结的校准依据列（老库无此列时补齐；
@@ -936,4 +995,122 @@ export function markCheckoutItemReturned(db, checkoutId, itemId, { condition, re
     )
     .run(returnedAt, condition, checkoutId, itemId);
   return info.changes === 1;
+}
+
+// ---------- 预约设备排班（由 server 在单事务内调用） ----------
+
+export function getScheduleRow(db, id) {
+  return db.prepare('SELECT * FROM schedules WHERE id = ?').get(id);
+}
+
+// 预约的生效排班（每个预约至多一条；无则 undefined）。
+export function getActiveScheduleRowByReservation(db, reservationId) {
+  return db
+    .prepare(`SELECT * FROM schedules WHERE reservation_id = ? AND status = 'active'`)
+    .get(reservationId);
+}
+
+// 预约的全部排班历史（含取消与改派旧记录），按 id 升序。
+export function listScheduleRowsByReservation(db, reservationId) {
+  return db
+    .prepare('SELECT * FROM schedules WHERE reservation_id = ? ORDER BY id')
+    .all(reservationId);
+}
+
+export function listScheduleRows(db, status) {
+  if (status) {
+    return db
+      .prepare('SELECT * FROM schedules WHERE status = ? ORDER BY start_utc, id')
+      .all(status);
+  }
+  return db.prepare('SELECT * FROM schedules ORDER BY start_utc, id').all();
+}
+
+// 指定设备与 [startIso, endIso) 重叠的生效排班（左闭右开）；可排除某条排班（改派探测）。
+export function listOverlappingActiveSchedulesByDevice(
+  db,
+  deviceNo,
+  startIso,
+  endIso,
+  excludeScheduleId = null,
+) {
+  const sql = `
+    SELECT * FROM schedules
+     WHERE status = 'active'
+       AND device_no = ?
+       AND start_utc < ?
+       AND ? < end_utc
+       AND (? IS NULL OR id != ?)
+     ORDER BY start_utc, id`;
+  return db
+    .prepare(sql)
+    .all(deviceNo, endIso, startIso, excludeScheduleId, excludeScheduleId);
+}
+
+// 全部生效排班（占用查询用；可按设备过滤）。
+export function listActiveScheduleRows(db, deviceNo = null) {
+  if (deviceNo !== null) {
+    return db
+      .prepare(
+        `SELECT * FROM schedules WHERE status = 'active' AND device_no = ?
+          ORDER BY start_utc, id`,
+      )
+      .all(deviceNo);
+  }
+  return db
+    .prepare(`SELECT * FROM schedules WHERE status = 'active' ORDER BY start_utc, id`)
+    .all();
+}
+
+export function insertSchedule(db, { reservationId, deviceNo, startUtc, endUtc }) {
+  const info = db
+    .prepare(
+      `INSERT INTO schedules (reservation_id, device_no, start_utc, end_utc)
+       VALUES (?, ?, ?, ?)`,
+    )
+    .run(reservationId, deviceNo, startUtc, endUtc);
+  return getScheduleRow(db, info.lastInsertRowid);
+}
+
+// 取消排班（条件更新：仅生效排班可取消；未命中返回 null）。
+export function cancelSchedule(db, id, nowIso) {
+  const info = db
+    .prepare(
+      `UPDATE schedules
+          SET status = 'cancelled', cancelled_at = ?
+        WHERE id = ? AND status = 'active'`,
+    )
+    .run(nowIso, id);
+  return info.changes === 1 ? getScheduleRow(db, id) : null;
+}
+
+// 改派：原子释放旧排班并占用新排班（由 server 在单事务内先后调用）：
+//   1) markScheduleReassigned 先把旧生效排班置为 reassigned（释放「每预约一条
+//      生效排班」的部分唯一索引与旧设备时段）；
+//   2) insertSchedule 再插入新生效排班（触发器对新设备做非重叠兜底）。
+// 任一步失败均随外层事务整体回滚，旧排班保持 active。
+export function markScheduleReassigned(db, oldId, newId) {
+  const info = db
+    .prepare(
+      `UPDATE schedules
+          SET status = 'reassigned', replaced_by_id = ?
+        WHERE id = ? AND status = 'active'`,
+    )
+    .run(newId, oldId);
+  return info.changes === 1 ? getScheduleRow(db, oldId) : null;
+}
+
+// 预约取消级联：其生效排班同步取消（条件更新，未命中返回 null）。
+// 调用方已在同事务内确认预约未开始，故此处不再校验时刻。
+export function cancelActiveScheduleByReservation(db, reservationId, nowIso) {
+  const active = getActiveScheduleRowByReservation(db, reservationId);
+  if (!active) return null;
+  const info = db
+    .prepare(
+      `UPDATE schedules
+          SET status = 'cancelled', cancelled_at = ?
+        WHERE id = ? AND status = 'active'`,
+    )
+    .run(nowIso, active.id);
+  return info.changes === 1 ? getScheduleRow(db, active.id) : null;
 }

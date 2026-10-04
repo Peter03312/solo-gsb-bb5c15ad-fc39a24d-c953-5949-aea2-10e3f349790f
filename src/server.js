@@ -71,6 +71,16 @@ import {
   insertCheckoutItem,
   getActiveCheckoutItemRow,
   markCheckoutItemReturned,
+  getScheduleRow,
+  getActiveScheduleRowByReservation,
+  listScheduleRowsByReservation,
+  listScheduleRows,
+  listOverlappingActiveSchedulesByDevice,
+  listActiveScheduleRows,
+  insertSchedule,
+  cancelSchedule,
+  markScheduleReassigned,
+  cancelActiveScheduleByReservation,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import { normalizeEntries, measureProgress, verifyMeasurements } from './verify.js';
@@ -97,6 +107,13 @@ import {
   isWithinReservation,
   isOverrun,
 } from './run.js';
+import {
+  normalizeScheduleInput,
+  intervalsOverlap,
+  deviceOccupancySegments,
+  isoOccupancySegments,
+  findDeviceConflicts,
+} from './schedule.js';
 import {
   normalizeLimitInput,
   normalizeDeviceNo,
@@ -158,6 +175,7 @@ export function createApp(db) {
       calibrations: listCalibrationRows(db).map((r) => calibrationView(r, Date.now())),
       items: listItemRows(db).map(itemView),
       checkouts: listCheckoutRows(db).map((r) => checkoutView(r, Date.now())),
+      schedules: listScheduleRows(db).map((r) => scheduleView(r, Date.now())),
     });
   });
 
@@ -594,7 +612,10 @@ export function createApp(db) {
         }
         const updated = cancelReservation(db, id, toIso(nowMs));
         if (!updated) throw new ConflictError([`预约 #${id} 状态已变化，请刷新后重试`]);
+        // 同步取消其生效排班（预约未开始，排班必然也未开始；占用随级联释放，历史保留）
+        const cancelledSchedule = cancelActiveScheduleByReservation(db, id, toIso(nowMs));
         view = reservationView(updated, currentHash(db), nowMs);
+        if (cancelledSchedule) view.cancelledScheduleId = cancelledSchedule.id;
       });
       tx();
       res.json(view);
@@ -668,6 +689,394 @@ export function createApp(db) {
         toMs: to,
       });
       res.json({ from: toIso(from), to: toIso(to), specs });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // ---------- 预约设备排班 ----------
+  //
+  // 把生效预约安排到具体离心设备；时段沿用预约冻结的 UTC 左闭右开 [start, end)，
+  // 不由调用方提供。每个预约至多一条生效排班：同预约同设备重复提交幂等返回原记录；
+  // 同预约提交另一台设备为改派——仅允许在预约开始前且预约尚未用于运行时进行，
+  // 在单事务内原子释放旧设备时段、占用新设备时段，新设备时段冲突则整事务回滚、
+  // 保留原排班。已取消 / 已开始 / 已用于运行的预约不得改派或新排班。
+  // 未开始且未运行的生效排班可取消（历史保留、释放占用）；预约取消时同步取消排班。
+  // 运行开始时若预约有生效排班，提交的设备编号必须与其一致。
+
+  function scheduleView(row, nowMs) {
+    const startMs = Date.parse(row.start_utc);
+    const endMs = Date.parse(row.end_utc);
+    const phase =
+      row.status !== 'active'
+        ? row.status
+        : nowMs < startMs
+          ? 'notStarted'
+          : nowMs < endMs
+            ? 'ongoing'
+            : 'ended';
+    // 已用于运行（任意状态的运行；开始后该预约即被锁定）
+    const usedByRun = !!getRunRowByReservation(db, row.reservation_id);
+    const started = nowMs >= startMs;
+    const active = row.status === 'active';
+    return {
+      id: row.id,
+      reservationId: row.reservation_id,
+      deviceNo: row.device_no,
+      startUtc: row.start_utc,
+      endUtc: row.end_utc,
+      status: row.status,
+      phase,
+      createdAt: row.created_at,
+      cancelledAt: row.cancelled_at,
+      replacedById: row.replaced_by_id,
+      usedByRun,
+      // 仅生效、未开始且预约未用于运行的排班可取消/改派
+      cancellable: active && !started && !usedByRun,
+      reassignable: active && !started && !usedByRun,
+    };
+  }
+
+  // 把排班行转为占用扫描线输入
+  function scheduleOverlapItems(rows) {
+    return rows.map((r) => ({
+      scheduleId: r.id,
+      reservationId: r.reservation_id,
+      startMs: Date.parse(r.start_utc),
+      endMs: Date.parse(r.end_utc),
+    }));
+  }
+
+  // 提交排班（新排班 / 幂等重放 / 改派同一入口）。
+  // 201 新排班（含改派成功后产生的新记录）；200 同预约同设备幂等返回原记录；
+  // 400 非法输入或未知预约；409 预约已取消/已开始/已用于运行，或新设备时段冲突。
+  app.post('/api/schedules', (req, res, next) => {
+    try {
+      const { errors, clean } = normalizeScheduleInput(req.body);
+      if (errors.length) throw new ValidationError(errors);
+      const { reservationId, deviceNo } = clean;
+
+      let status = 201;
+      let view;
+      const tx = db.transaction(() => {
+        const resRow = getReservationRow(db, reservationId);
+        if (!resRow) {
+          throw new ValidationError([`预约记录 #${reservationId} 不存在（未知预约编号）`]);
+        }
+        if (resRow.status !== 'active') {
+          throw new ConflictError([
+            `预约 #${reservationId} 已取消，不能安排设备排班（历史预约保留）`,
+          ]);
+        }
+        const nowMs = Date.now();
+        const startMs = Date.parse(resRow.start_utc);
+        const runRow = getRunRowByReservation(db, reservationId);
+        if (runRow) {
+          throw new ConflictError([
+            `预约 #${reservationId} 已用于运行 #${runRow.id}（运行编号「${runRow.run_no}」），` +
+              '不能新排班或改派',
+          ], { existingRunId: runRow.id });
+        }
+        if (nowMs >= startMs) {
+          throw new ConflictError([
+            `预约 #${reservationId} 已开始（${resRow.start_utc}），` +
+              '已开始的预约不能新排班或改派',
+          ]);
+        }
+
+        const existing = getActiveScheduleRowByReservation(db, reservationId);
+        if (existing) {
+          // 同预约同设备：幂等返回原排班（不重新核对占用，与其它幂等接口一致）
+          if (existing.device_no === deviceNo) {
+            view = scheduleView(existing, nowMs);
+            status = 200;
+            return;
+          }
+          // 改派：先探测新设备时段（冲突直接拒绝，旧排班不动）
+          const overlap = listOverlappingActiveSchedulesByDevice(
+            db,
+            deviceNo,
+            resRow.start_utc,
+            resRow.end_utc,
+          );
+          if (overlap.length) {
+            const probe = findDeviceConflicts(
+              scheduleOverlapItems(overlap),
+              startMs,
+              Date.parse(resRow.end_utc),
+            );
+            throw new ConflictError(
+              [
+                `设备「${deviceNo}」在 ${resRow.start_utc} 至 ${resRow.end_utc} 已有生效排班占用` +
+                  `（如排班 #${overlap[0].id}，预约 #${overlap[0].reservation_id}），` +
+                  '时段冲突，改派未执行，原排班保留',
+              ],
+              {
+                detail: {
+                  deviceNo,
+                  conflicts: probe.conflicts,
+                },
+              },
+            );
+          }
+          // 原子改派（整事务回滚保证冲突时原排班保留）：
+          //   1) 旧生效排班置为 reassigned，释放「每预约一条生效排班」唯一索引与旧设备；
+          //   2) 插入新生效排班，触发器兜底新设备非重叠。
+          const old = markScheduleReassigned(db, existing.id, null);
+          if (!old) throw new ConflictError(['原排班状态已变化，请刷新后重试']);
+          let row;
+          try {
+            row = insertSchedule(db, {
+              reservationId,
+              deviceNo,
+              startUtc: resRow.start_utc,
+              endUtc: resRow.end_utc,
+            });
+          } catch (dbErr) {
+            throw new ConflictError(
+              [
+                `设备「${deviceNo}」时段冲突，改派未执行，原排班保留：${dbErr && dbErr.message}`,
+              ],
+              { detail: { deviceNo } },
+            );
+          }
+          // 回填新排班指针（历史可追溯改派去向）
+          db.prepare(
+            `UPDATE schedules SET replaced_by_id = ? WHERE id = ? AND status = 'reassigned'`,
+          ).run(row.id, existing.id);
+          view = {
+            ...scheduleView(row, nowMs),
+            reassignedFrom: {
+              scheduleId: existing.id,
+              deviceNo: existing.device_no,
+            },
+          };
+          status = 201;
+          return;
+        }
+
+        // 新排班：核对设备时段（首尾相接允许）
+        const overlap = listOverlappingActiveSchedulesByDevice(
+          db,
+          deviceNo,
+          resRow.start_utc,
+          resRow.end_utc,
+        );
+        if (overlap.length) {
+          const probe = findDeviceConflicts(
+            scheduleOverlapItems(overlap),
+            startMs,
+            Date.parse(resRow.end_utc),
+          );
+          throw new ConflictError(
+            [
+              `设备「${deviceNo}」在 ${resRow.start_utc} 至 ${resRow.end_utc} 已有生效排班占用` +
+                `（如排班 #${overlap[0].id}，预约 #${overlap[0].reservation_id}），` +
+                '同设备生效排班不能重叠（首尾相接允许），排班未产生',
+            ],
+            {
+              detail: {
+                deviceNo,
+                conflicts: probe.conflicts,
+              },
+            },
+          );
+        }
+        let row;
+        try {
+          row = insertSchedule(db, {
+            reservationId,
+            deviceNo,
+            startUtc: resRow.start_utc,
+            endUtc: resRow.end_utc,
+          });
+        } catch (dbErr) {
+          throw new ConflictError(
+            [`设备「${deviceNo}」时段冲突，排班未产生：${dbErr && dbErr.message}`],
+            { detail: { deviceNo } },
+          );
+        }
+        view = scheduleView(row, nowMs);
+      });
+      tx();
+      res.status(status).json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // 排班列表：默认仅生效排班；?status=active|cancelled|reassigned 指定状态，
+  // ?all=1 返回全部（含历史）；?deviceNo= 按设备过滤（生效与历史均支持）；
+  // ?reservationId= 按预约过滤（非法 id 400）。
+  app.get('/api/schedules', (req, res, next) => {
+    try {
+      const nowMs = Date.now();
+      let statusFilter = 'active';
+      if (req.query.all !== undefined) statusFilter = null;
+      if (req.query.status !== undefined) {
+        if (!['active', 'cancelled', 'reassigned'].includes(req.query.status)) {
+          throw new ValidationError([
+            'status 仅支持 active / cancelled / reassigned（或用 all=1 查询全部）',
+          ]);
+        }
+        statusFilter = req.query.status;
+      }
+      let deviceNo = null;
+      if (req.query.deviceNo !== undefined) {
+        const dev = normalizeDeviceNo(req.query.deviceNo);
+        if (dev.errors.length) throw new ValidationError(dev.errors);
+        deviceNo = dev.clean.deviceNo;
+      }
+      let reservationId = null;
+      if (req.query.reservationId !== undefined) {
+        reservationId = Number(req.query.reservationId);
+        if (!Number.isInteger(reservationId) || reservationId <= 0) {
+          throw new ValidationError(['reservationId 必须是预约编号（正整数）']);
+        }
+      }
+
+      // 时间窗口参数（占用/冲突查询）
+      const fromMs = parseUtcMs(req.query.from);
+      const toMs = parseUtcMs(req.query.to);
+      if (req.query.from !== undefined && fromMs === null) {
+        throw new ValidationError(['from 不是合法的 UTC 时间（ISO 8601）']);
+      }
+      if (req.query.to !== undefined && toMs === null) {
+        throw new ValidationError(['to 不是合法的 UTC 时间（ISO 8601）']);
+      }
+      if ((req.query.from === undefined) !== (req.query.to === undefined)) {
+        throw new ValidationError(['from 与 to 必须同时提供（时段按左闭右开 [from, to) 计算）']);
+      }
+
+      let rows;
+      if (reservationId !== null) {
+        rows = listScheduleRowsByReservation(db, reservationId);
+        if (statusFilter) rows = rows.filter((r) => r.status === statusFilter);
+        if (deviceNo !== null) rows = rows.filter((r) => r.device_no === deviceNo);
+      } else {
+        rows = listScheduleRows(db, statusFilter);
+        if (deviceNo !== null) rows = rows.filter((r) => r.device_no === deviceNo);
+      }
+
+      // 占用与冲突：按设备/预约过滤条件取生效排班（不受 status 过滤影响）
+      const activeRows = listActiveScheduleRows(db, deviceNo).filter(
+        (r) => reservationId === null || r.reservation_id === reservationId,
+      );
+      const activeItems = scheduleOverlapItems(activeRows);
+
+      // 窗口缺省：覆盖过滤后的全部生效排班；无排班则为零长窗口（当前时刻）
+      let from = fromMs;
+      let to = toMs;
+      if (from === null || to === null) {
+        if (activeItems.length) {
+          from = from !== null ? from : Math.min(...activeItems.map((i) => i.startMs));
+          to = to !== null ? to : Math.max(...activeItems.map((i) => i.endMs));
+        } else {
+          from = to = nowMs;
+        }
+      }
+      if (from > to) {
+        throw new ValidationError(['from 不能晚于 to（时段按左闭右开 [from, to) 计算）']);
+      }
+
+      const clipped = activeItems
+        .filter((i) => intervalsOverlap(i.startMs, i.endMs, from, to))
+        .map((i) => ({ ...i }));
+
+      // 按设备分组的占用分段
+      const byDevice = new Map();
+      for (const it of clipped) {
+        const devRow = activeRows.find((r) => r.id === it.scheduleId);
+        const key = devRow ? devRow.device_no : '';
+        if (!byDevice.has(key)) byDevice.set(key, []);
+        byDevice.get(key).push(it);
+      }
+      const devices = [...byDevice.entries()]
+        .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+        .map((dev) => ({
+          deviceNo: dev[0],
+          segments: isoOccupancySegments(
+            deviceOccupancySegments(dev[1], from, to),
+          ),
+        }));
+
+      const payload = {
+        from: toIso(from),
+        to: toIso(to),
+        devices,
+        schedules: rows.map((r) => scheduleView(r, nowMs)),
+      };
+
+      // 探测：deviceNo + from + to 齐全时，给出该设备在窗口内是否可排与冲突明细
+      if (
+        deviceNo !== null &&
+        req.query.from !== undefined &&
+        req.query.to !== undefined &&
+        from < to
+      ) {
+        const probeCandidates = listOverlappingActiveSchedulesByDevice(
+          db,
+          deviceNo,
+          toIso(from),
+          toIso(to),
+        );
+        const probe = findDeviceConflicts(
+          scheduleOverlapItems(probeCandidates),
+          from,
+          to,
+        );
+        payload.probe = {
+          deviceNo,
+          available: probe.available,
+          conflicts: probe.conflicts,
+        };
+      }
+
+      res.json(payload);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  app.get('/api/schedules/:id', (req, res, next) => {
+    const row = getScheduleRow(db, Number(req.params.id));
+    if (!row) return res.status(404).json({ error: '排班记录不存在' });
+    res.json(scheduleView(row, Date.now()));
+  });
+
+  // 取消排班：仅生效、未开始且预约尚未用于运行的排班可取消；
+  // 已取消/已改派重复调用幂等返回原记录（历史保留）。
+  app.post('/api/schedules/:id/cancel', (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const existed = getScheduleRow(db, id);
+      if (!existed) return res.status(404).json({ error: '排班记录不存在' });
+      let view;
+      const tx = db.transaction(() => {
+        const row = getScheduleRow(db, id);
+        if (row.status !== 'active') {
+          view = scheduleView(row, Date.now());
+          return;
+        }
+        const nowMs = Date.now();
+        const runRow = getRunRowByReservation(db, row.reservation_id);
+        if (runRow) {
+          throw new ConflictError([
+            `排班 #${id} 的预约 #${row.reservation_id} 已用于运行 #${runRow.id}` +
+              `（运行编号「${runRow.run_no}」），不能取消`,
+          ], { existingRunId: runRow.id });
+        }
+        if (nowMs >= Date.parse(row.start_utc)) {
+          throw new ConflictError([
+            `排班 #${id} 对应预约已开始（${row.start_utc}），不能取消`,
+          ]);
+        }
+        const updated = cancelSchedule(db, id, toIso(nowMs));
+        if (!updated) throw new ConflictError([`排班 #${id} 状态已变化，请刷新后重试`]);
+        view = scheduleView(updated, nowMs);
+      });
+      tx();
+      res.json(view);
     } catch (e) {
       next(e);
     }
@@ -1241,6 +1650,16 @@ export function createApp(db) {
               `而预约 #${reservationId} 依据发布图 #${resRow.publication_id}，` +
               '二者必须指向同一张发布图',
           ]);
+        }
+
+        // 2b. 预约有生效排班时，运行提交的设备编号必须与排班设备一致；
+        //     无生效排班沿用原放行规则（不强制设备来源）。
+        const scheduleRow = getActiveScheduleRowByReservation(db, reservationId);
+        if (scheduleRow && scheduleRow.device_no !== deviceNo) {
+          throw new ConflictError([
+            `预约 #${reservationId} 已排班到设备「${scheduleRow.device_no}」（排班 #${scheduleRow.id}），` +
+              `运行提交的设备「${deviceNo}」与排班不一致；运行必须在排班设备上开始`,
+          ], { detail: { scheduleId: scheduleRow.id, scheduledDeviceNo: scheduleRow.device_no } });
         }
 
         // 3. 发布图存在、可行且当前可用（数据指纹与当前录入一致）
